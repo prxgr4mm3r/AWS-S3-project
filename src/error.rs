@@ -5,14 +5,12 @@ use serde::ser::StdError;
 
 #[derive(Debug, Deserialize)]
 pub struct DBError {
-    status_code: u16,
     error_message: String,
 }
 
 impl DBError {
-    pub fn new(status_code: u16, error_message: String) -> DBError {
+    pub fn new(error_message: String) -> DBError {
         DBError {
-            status_code,
             error_message,
         }
     }
@@ -32,9 +30,9 @@ impl fmt::Display for DBError {
 impl From<SQLError> for DBError {
     fn from(error: SQLError) -> DBError {
         match error {
-            SQLError::RowNotFound => DBError::new(404, "Account not found".to_string()),
-            SQLError::Database(err) => DBError::new(409, err.message().to_string()),
-            err => DBError::new(500, format!("Unknown database error: {}", err)),
+            SQLError::RowNotFound => DBError::new("Account not found".to_string()),
+            SQLError::Database(err) => DBError::new(err.message().to_string()),
+            err => DBError::new(format!("Unknown database error: {}", err)),
         }
     }
 }

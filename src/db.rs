@@ -5,24 +5,17 @@ use sqlx::postgres::PgPool;
 use std::env;
 use s3::AccountConfigQuery;
 use crate::s3;
-
-pub type PoolConn = sqlx::pool::PoolConnection<sqlx::Postgres>;
-
 #[derive(Serialize, Deserialize)]
-pub struct Note {
-    pub id: i32,
-    pub name: String,
-    pub text: String,
+pub struct Event {
+    pub key_id: String,
+    pub event_type: String,
+    pub bucket_name: String,
+    pub file_name: String,
+    pub file_type: String,
+    pub file_size: String,
 }
-
-pub async fn connection(pool: &PgPool) -> Result<PoolConn, DBError> {
-    PgPool::acquire(pool)
-        .await
-        .map_err(|e| DBError::new(500, format!("Failed getting database connection: {}", e)))
-}
-
 pub async fn init() -> Result<PgPool, DBError> {
-    let db_url = env::var("DATABASE_URL").expect("Database url must be set!");
+    let db_url = env::var("DATABASE_URL").unwrap();
     let pool = PgPool::connect(&db_url).await.unwrap();
     Ok(pool)
 }
@@ -106,7 +99,7 @@ pub async fn get_account_cfg(pool: &PgPool) -> Result<AccountConfigQuery, DBErro
         .fetch_one(pool)
         .await?;
     if account_number.count.unwrap() == 0 {
-        return Err(DBError::new(409, "You are not logged in".to_string()));
+        return Err(DBError::new("You are not logged in!".to_string()));
     }
     let sql_response = sqlx::query!(
         r#"
@@ -136,95 +129,19 @@ pub async fn get_bucket_name(pool: &PgPool) -> Result<String, DBError> {
     Ok(sql_response.bucket_name)
 }
 
-// pub async fn filter(
-//     conn: &mut PoolConn,
-//     page: usize,
-//     size: usize,
-//     q: String,
-// ) -> Result<Vec<Note>, DBError> {
-//     let mut query_str = "%".to_owned();
-//     query_str.push_str(q.as_str());
-//     query_str.push_str("%");
-//
-//     let offset: i64 = (page * size) as i64;
-//     let limit: i64 = size as i64;
-//
-//     let sql_response = sqlx::query!(
-//         r#"
-//             SELECT id, name, text
-//             FROM notes
-//             WHERE name LIKE $1
-//             ORDER BY id
-//             OFFSET $2
-//             LIMIT $3;
-//         "#,
-//         &query_str,
-//         offset,
-//         limit
-//     )
-//         .fetch_all(conn)
-//         .await?;
-//
-//     let mut result = Vec::new();
-//
-//     for i in 0..sql_response.len() {
-//         result.push(Note {
-//             id: sql_response.get(i).unwrap().id,
-//             name: sql_response.get(i).unwrap().name.clone(),
-//             text: sql_response.get(i).unwrap().text.clone(),
-//         });
-//     }
-//
-//     Ok(result)
-// }
-//
-// pub async fn delete(conn: &mut PoolConn, id: i32) -> Result<i32, DBError> {
-//     let sql_response = sqlx::query!(
-//         r#"
-//         DELETE FROM notes
-//         WHERE id = $1
-//         RETURNING id;"#,
-//         id
-//     )
-//         .fetch_one(conn)
-//         .await?;
-//     Ok(sql_response.id)
-// }
-
-// pub async fn update(
-//     conn: &mut PoolConn,
-//     id: i32,
-//     note: NoteQuery,
-// ) -> Result<i32, DBError> {
-//     let sql_response = sqlx::query!(
-//         r#"
-//         UPDATE notes
-//         SET (name, text) = ($1, $2)
-//         WHERE id = $3
-//         RETURNING id;"#,
-//         note.name,
-//         note.text,
-//         id
-//     )
-//         .fetch_one(conn)
-//         .await?;
-// 
-//     Ok(sql_response.id)
-// }
-
-// pub async fn find(conn: &mut PoolConn, id: i32) -> Result<Note, DBError> {
-//     let sql_response = sqlx::query!(
-//         r#"
-//         SELECT name, text
-//         FROM notes
-//         WHERE id = $1;"#,
-//         id
-//     )
-//         .fetch_one(conn)
-//         .await?;
-//     Ok(Note {
-//         id,
-//         name: sql_response.name,
-//         text: sql_response.text,
-//     })
-// }
+pub async fn add_event(pool: &PgPool, event: Event) -> Result<i32, DBError> {
+    let sql_responce = sqlx::query!(
+      r#"
+      INSERT INTO s3_events (key_id, event_type, bucket_name, file_name, file_type, file_size) VALUES ($1, $2, $3, $4, $5, $6)
+      RETURNING id;"#,
+        event.key_id,
+        event.event_type,
+        event.bucket_name,
+        event.file_name,
+        event.file_type,
+        event.file_size
+    )
+        .fetch_one(pool)
+        .await?;
+    Ok(sql_responce.id)
+}

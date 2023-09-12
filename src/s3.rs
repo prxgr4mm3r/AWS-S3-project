@@ -1,17 +1,13 @@
-use anyhow::{anyhow, bail, Context, Result}; // (xp) (thiserror in prod)
+use anyhow::{anyhow, bail, Result};
 use aws_sdk_s3::{config, Client, Credentials, Region, ByteStream};
 use std::fs::{create_dir_all, File};
 use std::io::{BufWriter, Write};
 use std::io::stdin;
 use std::path::Path;
 use sqlx::PgPool;
-use tokio_stream::StreamExt;
+use tokio_stream::{Stream, StreamExt};
 use crate::db;
-
-const ENV_CRED_KEY_ID: &str = "S3_KEY_ID";
-const ENV_CRED_KEY_SECRET: &str = "S3_KEY_SECRET";
-const REGION: &str = "REGION";
-const BUCKET_NAME: &str = "BUCKET_NAME";
+use crate::db::Event;
 #[derive(Debug)]
 pub struct S3 {
     pub client: Client,
@@ -68,8 +64,15 @@ impl S3 {
             region,
             bucket_name
         }).await?;
-        Self::get_asw_client(pool).await?;
-        println!("You are successfully logged in!");
+        match Self::get_asw_client(pool).await {
+            Ok(_) => {
+                println!("You are successfully logged in!");
+            }
+            Err(_) => {
+                db::log_out(&pool).await?;
+                bail!("You are not logged in! Check your credentials and try again!");
+            }
+        }
         Ok(())
     }
     pub async fn log_out(pool: &PgPool) -> Result<()>{
@@ -92,10 +95,12 @@ impl S3 {
 
         let client = Client::from_conf(conf);
 
+        client.list_objects_v2().bucket(&cfg.bucket_name).send().await?;
+
         Ok(client)
     }
-    pub async fn upload_file(&self, pool: &PgPool, path: &Path) -> Result<()> {
-        let bucket_name = db::get_bucket_name(&pool).await?;
+    pub async fn upload_file(&self, pool: &PgPool, path: &Path, dir: &Path) -> Result<()> {
+        let account = db::get_account_cfg(&pool).await?;
         //Validate path
         if !path.exists() {
             bail!("Path {} does not exist", path.display());
@@ -107,6 +112,9 @@ impl S3 {
             bail!("Path {} is not a file", path.display());
         }
 
+        let file_name = Path::new(key).file_name().ok_or_else(|| anyhow!("Invalid file name for {:?}", key))?;
+        let dir = dir.join(file_name);
+        let dir_key = dir.to_str().ok_or_else(|| anyhow!("Invalid path {path:?}"))?;
         //Prepare data
 
         let body = ByteStream::from_path(&path).await?;
@@ -115,40 +123,85 @@ impl S3 {
         let req = self
             .client
             .put_object()
-            .bucket(&bucket_name)
-            .key(key)
+            .bucket(&account.bucket_name.clone())
+            .key(dir_key.clone())
             .body(body)
-            .content_type(content_type);
+            .content_type(&content_type)
+            .send().await?;
 
-        req.send().await?;
-        println!("Uploaded file {} to bucket {}", &key, &bucket_name);
+        let size = self.file_size(pool, &dir).await?;
+
+
+        db::add_event(pool, Event {
+            key_id: account.key_id,
+            event_type: "upload".to_string(),
+            bucket_name: account.bucket_name.clone(),
+            file_name: dir_key.to_string(),
+            file_type: content_type,
+            file_size: size.clone(),
+        }).await?;
+
+        println!("Uploaded file {} to bucket {}. Size: {}", &dir_key, &account.bucket_name, &size);
         Ok(())
     }
-    pub async fn delete_file(&self, pool: &PgPool, path: &Path) -> Result<()> {
-        let bucket_name = db::get_bucket_name(&pool).await?;
 
-        if !path.exists() {
-            bail!("Path {} does not exist", path.display());
-        }
+    pub async fn file_size(&self, pool: &PgPool, path: &Path) -> Result<String> {
+        let bucket_name = db::get_bucket_name(&pool).await?;
 
         let key = path.to_str().ok_or_else(|| anyhow!("Invalid path {path:?}"))?;
 
-        if !path.is_file() {
-            bail!("Path {} is not a file", path.display());
-        }
+        let size = self
+            .client
+            .get_object()
+            .bucket(&bucket_name)
+            .key(key)
+            .send().await?.body.size_hint().0 as i32;
+
+        Ok(format!("{} Bytes", size))
+    }
+
+    pub async fn content_type(&self, pool: &PgPool, path: &Path) -> Result<String> {
+        let bucket_name = db::get_bucket_name(&pool).await?;
+
+        let key = path.to_str().ok_or_else(|| anyhow!("Invalid path {path:?}"))?;
+
+        let content_type = self
+            .client
+            .get_object()
+            .bucket(&bucket_name)
+            .key(key)
+            .send().await?.content_type.unwrap_or_default();
+        Ok(content_type)
+    }
+
+    pub async fn delete_file(&self, pool: &PgPool, path: &Path) -> Result<()> {
+        let account = db::get_account_cfg(&pool).await?;
+
+        let key = path.to_str().ok_or_else(|| anyhow!("Invalid path {path:?}"))?;
+
+        let content_type = self.content_type(pool, path).await?;
+        let size = self.file_size(pool, path).await?;
 
         self.client
             .delete_object()
-            .bucket(&bucket_name)
+            .bucket(&account.bucket_name)
             .key(key)
             .send()
             .await?;
-        println!("Deleted file {} from bucket {}", &key, &bucket_name);
+
+        db::add_event(pool, Event {
+            key_id: account.key_id,
+            event_type: "delete".to_string(),
+            bucket_name: account.bucket_name.clone(),
+            file_name: key.to_string(),
+            file_type: content_type,
+            file_size: size.clone(),
+        }).await?;
+        println!("Deleted file {} from bucket {}", &key, &account.bucket_name);
         Ok(())
     }
     pub async fn download_file(&self, pool: &PgPool, key: &Path, dir: &Path) -> Result<()> {
-        let bucket_name = db::get_bucket_name(&pool).await?;
-        //Validate key
+        let account = db::get_account_cfg(&pool).await?;
         let key = key.to_str().ok_or_else(|| anyhow!("Invalid path {key:?}"))?;
 
 
@@ -156,7 +209,10 @@ impl S3 {
             bail!("Directory {} does not exist", dir.display())
         }
 
-        let file_path = dir.join(key);
+        let file_name = Path::new(key).file_name().ok_or_else(|| anyhow!("Invalid file name for {:?}", key))?;
+
+        println!("file_name: {:?}", file_name);
+        let file_path = dir.join(file_name);
         let parent_dir = file_path.parent().ok_or_else(|| anyhow!("Invalid parent path for {:?}", file_path))?;
         if !parent_dir.exists() {
             create_dir_all(parent_dir)?;
@@ -165,9 +221,12 @@ impl S3 {
         let res = self
             .client
             .get_object()
-            .bucket(bucket_name)
+            .bucket(&account.bucket_name)
             .key(key)
             .send().await?;
+
+        let size = format!("{} Bytes", res.body.size_hint().0);
+        let content_type = res.content_type.unwrap_or_default();
 
         let mut data = res.body;
         let file = File::create(&file_path)?;
@@ -177,6 +236,16 @@ impl S3 {
         }
         buf_writer.flush()?;
 
+        db::add_event(pool, Event {
+            key_id: account.key_id,
+            event_type: "download".to_string(),
+            bucket_name: account.bucket_name.clone(),
+            file_name: key.to_string(),
+            file_type: content_type,
+            file_size: size,
+        }).await?;
+
+        println!("Downloaded file {} from bucket {}", &key, &account.bucket_name);
         Ok(())
     }
     pub async fn list_keys(&self, pool: &PgPool) -> Result<Vec<String>> {

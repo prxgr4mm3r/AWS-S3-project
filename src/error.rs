@@ -1,7 +1,7 @@
+use serde::ser::StdError;
 use serde::Deserialize;
 use sqlx::Error as SQLError;
 use std::fmt;
-use serde::ser::StdError;
 
 #[derive(Debug, Deserialize)]
 pub struct DBError {
@@ -10,9 +10,7 @@ pub struct DBError {
 
 impl DBError {
     pub fn new(error_message: String) -> DBError {
-        DBError {
-            error_message,
-        }
+        DBError { error_message }
     }
 }
 
